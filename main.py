@@ -5,6 +5,7 @@ from bson import ObjectId
 from datetime import datetime, timedelta
 import os
 from pydantic import BaseModel
+from typing import Optional
 
 app = FastAPI()
 
@@ -27,6 +28,7 @@ class StudentModel(BaseModel):
     student_class: str
     fees: int
     institute_id: str
+    joining_date: Optional[str] = None  # Allows custom backdated entry
 
 class TransactionModel(BaseModel):
     student_id: str
@@ -44,7 +46,7 @@ def process_billing_cycles(institute_id: str):
     now = datetime.now()
     today_str = now.strftime("%Y-%m-%d")
     
-    # Find all active students whose billing date has arrived or passed
+    # Find all active students whose next 30-day billing date has arrived
     due_students = db.students.find({
         "institute_id": institute_id,
         "status": "active",
@@ -55,7 +57,7 @@ def process_billing_cycles(institute_id: str):
         # Add the monthly fee to their current due amount
         new_due = student.get("due_amount", 0) + student.get("fees", 0)
         
-        # Move their next billing date forward by 30 days
+        # Move their next billing date forward by another 30 days
         current_billing = datetime.strptime(student["next_billing_date"], "%Y-%m-%d")
         next_billing = (current_billing + timedelta(days=30)).strftime("%Y-%m-%d")
         
@@ -71,7 +73,7 @@ def process_billing_cycles(institute_id: str):
 # --- ENDPOINTS ---
 @app.get("/api/dashboard-stats")
 async def get_dashboard_stats(institute_id: str = "LAKSHYA_001"):
-    # Run the billing processor so data is perfectly accurate
+    # Run the billing processor first so data is perfectly accurate
     process_billing_cycles(institute_id)
     
     now = datetime.now()
@@ -83,7 +85,7 @@ async def get_dashboard_stats(institute_id: str = "LAKSHYA_001"):
     first_day = now.replace(day=1).strftime("%Y-%m-%d")
     new_regs = db.students.count_documents({"institute_id": institute_id, "joining_date": {"$gte": first_day}})
 
-    # Collected Revenue
+    # Collected Revenue (Transactions matching current month)
     tx_pipeline = [
         {"$match": {"institute_id": institute_id, "month_paid_for": current_month_name}},
         {"$group": {"_id": None, "total": {"$sum": "$amount"}}}
@@ -91,7 +93,7 @@ async def get_dashboard_stats(institute_id: str = "LAKSHYA_001"):
     tx_result = list(db.transactions.aggregate(tx_pipeline))
     collected = tx_result[0]["total"] if tx_result else 0
 
-    # Pending Revenue (Excluding Trials)
+    # Pending Revenue (Excluding Trials and Inactive students)
     due_pipeline = [
         {"$match": {
             "institute_id": institute_id, 
@@ -116,20 +118,25 @@ async def get_dashboard_stats(institute_id: str = "LAKSHYA_001"):
 async def add_student(student: StudentModel):
     now = datetime.now()
     student_dict = student.dict()
-    student_dict["joining_date"] = now.strftime("%Y-%m-%d")
+    
+    # Use the provided date, or default to today
+    actual_join_date = student.joining_date if student.joining_date else now.strftime("%Y-%m-%d")
+    
+    student_dict["joining_date"] = actual_join_date
     student_dict["status"] = "active"
     student_dict["is_paid"] = False 
     student_dict["due_amount"] = student.fees 
     
-    # Set the exact date the next payment will automatically be added
-    student_dict["next_billing_date"] = (now + timedelta(days=30)).strftime("%Y-%m-%d")
+    # Set the exact date the next payment will automatically be added (30 days from joining)
+    join_date_obj = datetime.strptime(actual_join_date, "%Y-%m-%d")
+    student_dict["next_billing_date"] = (join_date_obj + timedelta(days=30)).strftime("%Y-%m-%d")
     
     db.students.insert_one(student_dict)
     return {"message": "Student Registered Successfully"}
 
 @app.get("/api/students")
 async def get_students(institute_id: str = "LAKSHYA_001"):
-    process_billing_cycles(institute_id) # Update dues before showing list
+    process_billing_cycles(institute_id) # Ensure dues are updated
     students = list(db.students.find({"institute_id": institute_id}))
     for s in students:
         s["_id"] = str(s["_id"])
@@ -143,6 +150,7 @@ async def record_transaction(tx: TransactionModel):
     tx_dict["time"] = now.strftime("%H:%M")
     db.transactions.insert_one(tx_dict)
     
+    # Deduct payment amount from due_amount
     student = db.students.find_one({"_id": ObjectId(tx.student_id)})
     if student:
         new_due = student.get("due_amount", student["fees"]) - tx.amount
